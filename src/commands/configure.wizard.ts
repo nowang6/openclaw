@@ -94,12 +94,15 @@ async function promptWebToolsConfig(
 ): Promise<OpenClawConfig> {
   const existingSearch = nextConfig.tools?.web?.search;
   const existingFetch = nextConfig.tools?.web?.fetch;
+  const existingProvider = existingSearch?.provider ?? "brave";
   const hasSearchKey = Boolean(existingSearch?.apiKey);
+  const hasBochaKey = Boolean(process.env.BOCHA_API_KEY);
+  const hasBraveKey = Boolean(process.env.BRAVE_API_KEY);
 
   note(
     [
       "Web search lets your agent look things up online using the `web_search` tool.",
-      "It requires a Brave Search API key (you can store it in the config or set BRAVE_API_KEY in the Gateway environment).",
+      "Choose a provider: Brave (default), Perplexity (AI-synthesized answers), or Bocha (fast, up to 50 results).",
       "Docs: https://docs.openclaw.ai/tools/web",
     ].join("\n"),
     "Web search",
@@ -107,8 +110,8 @@ async function promptWebToolsConfig(
 
   const enableSearch = guardCancel(
     await confirm({
-      message: "Enable web_search (Brave Search)?",
-      initialValue: existingSearch?.enabled ?? hasSearchKey,
+      message: "Enable web_search?",
+      initialValue: existingSearch?.enabled ?? hasSearchKey ?? hasBochaKey ?? hasBraveKey,
     }),
     runtime,
   );
@@ -119,23 +122,74 @@ async function promptWebToolsConfig(
   };
 
   if (enableSearch) {
+    const providerChoice = guardCancel(
+      await select({
+        message: "Select search provider",
+        options: [
+          {
+            value: "brave",
+            label: "Brave Search",
+            hint: "Fast, structured results (BRAVE_API_KEY)",
+          },
+          {
+            value: "perplexity",
+            label: "Perplexity Sonar",
+            hint: "AI-synthesized answers with citations",
+          },
+          {
+            value: "bocha",
+            label: "Bocha Search",
+            hint: "Fast, up to 50 results (BOCHA_API_KEY)",
+          },
+        ],
+        initialValue: existingProvider,
+      }),
+      runtime,
+    );
+
+    nextSearch = { ...nextSearch, provider: providerChoice };
+
+    let keyEnvVar: string;
+    let keyLabel: string;
+    let keyPlaceholder: string;
+    let keyDocs: string;
+
+    if (providerChoice === "bocha") {
+      keyEnvVar = "BOCHA_API_KEY";
+      keyLabel = "Bocha API key";
+      keyPlaceholder = "BOCHA-API-KEY...";
+      keyDocs = "Get your key at https://api.bocha.cn";
+    } else if (providerChoice === "perplexity") {
+      keyEnvVar = "PERPLEXITY_API_KEY or OPENROUTER_API_KEY";
+      keyLabel = "Perplexity/OpenRouter API key";
+      keyPlaceholder = "pplx-... or sk-or-...";
+      keyDocs = "Get your key at https://www.perplexity.ai or https://openrouter.ai";
+    } else {
+      keyEnvVar = "BRAVE_API_KEY";
+      keyLabel = "Brave Search API key";
+      keyPlaceholder = "BSA...";
+      keyDocs = "Get your key at https://brave.com/search/api/";
+    }
+
+    const hasKey = providerChoice === "bocha" ? hasBochaKey : hasBraveKey;
     const keyInput = guardCancel(
       await text({
         message: hasSearchKey
-          ? "Brave Search API key (leave blank to keep current or use BRAVE_API_KEY)"
-          : "Brave Search API key (paste it here; leave blank to use BRAVE_API_KEY)",
-        placeholder: hasSearchKey ? "Leave blank to keep current" : "BSA...",
+          ? `${keyLabel} (leave blank to keep current or use ${keyEnvVar})`
+          : `${keyLabel} (paste it here; leave blank to use ${keyEnvVar})`,
+        placeholder: hasSearchKey ? "Leave blank to keep current" : keyPlaceholder,
       }),
       runtime,
     );
     const key = String(keyInput ?? "").trim();
     if (key) {
       nextSearch = { ...nextSearch, apiKey: key };
-    } else if (!hasSearchKey) {
+    } else if (!hasSearchKey && !hasKey) {
       note(
         [
           "No key stored yet, so web_search will stay unavailable.",
-          "Store a key here or set BRAVE_API_KEY in the Gateway environment.",
+          `Store a key here or set ${keyEnvVar} in the Gateway environment.`,
+          keyDocs,
           "Docs: https://docs.openclaw.ai/tools/web",
         ].join("\n"),
         "Web search",

@@ -2,6 +2,7 @@ import { Type } from "@sinclair/typebox";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { AnyAgentTool } from "./common.js";
 import { formatCliCommand } from "../../cli/command-format.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { wrapWebContent } from "../../security/external-content.js";
 import { jsonResult, readNumberParam, readStringParam } from "./common.js";
 import {
@@ -17,11 +18,15 @@ import {
   writeCache,
 } from "./web-shared.js";
 
-const SEARCH_PROVIDERS = ["brave", "perplexity"] as const;
+const log = createSubsystemLogger("agents/tools/web-search");
+
+const SEARCH_PROVIDERS = ["brave", "perplexity", "bocha"] as const;
 const DEFAULT_SEARCH_COUNT = 5;
 const MAX_SEARCH_COUNT = 10;
+const MAX_BOCHA_SEARCH_COUNT = 50;
 
 const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
+const BOCHA_SEARCH_ENDPOINT = "https://api.bocha.cn/v1/web-search";
 const DEFAULT_PERPLEXITY_BASE_URL = "https://openrouter.ai/api/v1";
 const PERPLEXITY_DIRECT_BASE_URL = "https://api.perplexity.ai";
 const DEFAULT_PERPLEXITY_MODEL = "perplexity/sonar-pro";
@@ -36,31 +41,41 @@ const WebSearchSchema = Type.Object({
   query: Type.String({ description: "Search query string." }),
   count: Type.Optional(
     Type.Number({
-      description: "Number of results to return (1-10).",
+      description: "Number of results to return (1-10 for brave/perplexity, 1-50 for bocha).",
       minimum: 1,
-      maximum: MAX_SEARCH_COUNT,
+      maximum: MAX_BOCHA_SEARCH_COUNT,
     }),
   ),
   country: Type.Optional(
     Type.String({
       description:
-        "2-letter country code for region-specific results (e.g., 'DE', 'US', 'ALL'). Default: 'US'.",
+        "2-letter country code for region-specific results (e.g., 'DE', 'US', 'ALL'). Default: 'US' (Brave only).",
     }),
   ),
   search_lang: Type.Optional(
     Type.String({
-      description: "ISO language code for search results (e.g., 'de', 'en', 'fr').",
+      description: "ISO language code for search results (e.g., 'de', 'en', 'fr') (Brave only).",
     }),
   ),
   ui_lang: Type.Optional(
     Type.String({
-      description: "ISO language code for UI elements.",
+      description: "ISO language code for UI elements (Brave only).",
     }),
   ),
   freshness: Type.Optional(
     Type.String({
       description:
-        "Filter results by discovery time (Brave only). Values: 'pd' (past 24h), 'pw' (past week), 'pm' (past month), 'py' (past year), or date range 'YYYY-MM-DDtoYYYY-MM-DD'.",
+        "Filter results by discovery time. For Brave: 'pd' (past 24h), 'pw' (past week), 'pm' (past month), 'py' (past year), or date range 'YYYY-MM-DDtoYYYY-MM-DD'. For Bocha: 'noLimit', 'pd', 'pw', 'pm', 'py', or date range 'YYYY-MM-DDtoYYYY-MM-DD'.",
+    }),
+  ),
+  site: Type.Optional(
+    Type.String({
+      description: "Limit search to specific website/domain (Bocha only, e.g., 'example.com').",
+    }),
+  ),
+  summary: Type.Optional(
+    Type.Boolean({
+      description: "Return text summary of search results (Bocha only, default: false).",
     }),
   ),
 });
@@ -82,6 +97,53 @@ type BraveSearchResponse = {
   web?: {
     results?: BraveSearchResult[];
   };
+};
+
+type BochaWebPage = {
+  id?: string;
+  name?: string;
+  url?: string;
+  displayUrl?: string;
+  snippet?: string;
+  siteName?: string;
+  siteIcon?: string;
+  datePublished?: string;
+  dateLastCrawled?: string;
+  cachedPageUrl?: string | null;
+};
+
+type BochaImage = {
+  thumbnailUrl?: string;
+  contentUrl?: string;
+  hostPageUrl?: string;
+  webSearchUrl?: string | null;
+};
+
+type BochaSearchResponse = {
+  code?: number;
+  log_id?: string;
+  msg?: string | null;
+  data?: {
+    _type?: string;
+    queryContext?: {
+      originalQuery?: string;
+    };
+    webPages?: {
+      webSearchUrl?: string;
+      totalEstimatedMatches?: number;
+      value?: BochaWebPage[];
+      someResultsRemoved?: boolean;
+    };
+    images?: {
+      id?: string | null;
+      readLink?: string | null;
+      webSearchUrl?: string | null;
+      value?: BochaImage[];
+      isFamilyFriendly?: boolean | null;
+    };
+    videos?: unknown;
+  };
+  summary?: string;
 };
 
 type PerplexityConfig = {
@@ -121,9 +183,16 @@ function resolveSearchEnabled(params: { search?: WebSearchConfig; sandboxed?: bo
   return true;
 }
 
-function resolveSearchApiKey(search?: WebSearchConfig): string | undefined {
+function resolveSearchApiKey(
+  search?: WebSearchConfig,
+  provider?: (typeof SEARCH_PROVIDERS)[number],
+): string | undefined {
   const fromConfig =
     search && "apiKey" in search && typeof search.apiKey === "string" ? search.apiKey.trim() : "";
+  if (provider === "bocha") {
+    const fromEnv = (process.env.BOCHA_API_KEY ?? "").trim();
+    return fromConfig || fromEnv || undefined;
+  }
   const fromEnv = (process.env.BRAVE_API_KEY ?? "").trim();
   return fromConfig || fromEnv || undefined;
 }
@@ -134,6 +203,13 @@ function missingSearchKeyPayload(provider: (typeof SEARCH_PROVIDERS)[number]) {
       error: "missing_perplexity_api_key",
       message:
         "web_search (perplexity) needs an API key. Set PERPLEXITY_API_KEY or OPENROUTER_API_KEY in the Gateway environment, or configure tools.web.search.perplexity.apiKey.",
+      docs: "https://docs.openclaw.ai/tools/web",
+    };
+  }
+  if (provider === "bocha") {
+    return {
+      error: "missing_bocha_api_key",
+      message: `web_search (bocha) needs a Bocha API key. Run \`${formatCliCommand("openclaw configure --section web")}\` to store it, or set BOCHA_API_KEY in the Gateway environment.`,
       docs: "https://docs.openclaw.ai/tools/web",
     };
   }
@@ -154,6 +230,9 @@ function resolveSearchProvider(search?: WebSearchConfig): (typeof SEARCH_PROVIDE
   }
   if (raw === "brave") {
     return "brave";
+  }
+  if (raw === "bocha") {
+    return "bocha";
   }
   return "brave";
 }
@@ -247,9 +326,14 @@ function resolvePerplexityModel(perplexity?: PerplexityConfig): string {
   return fromConfig || DEFAULT_PERPLEXITY_MODEL;
 }
 
-function resolveSearchCount(value: unknown, fallback: number): number {
+function resolveSearchCount(
+  value: unknown,
+  fallback: number,
+  provider?: (typeof SEARCH_PROVIDERS)[number],
+): number {
   const parsed = typeof value === "number" && Number.isFinite(value) ? value : fallback;
-  const clamped = Math.max(1, Math.min(MAX_SEARCH_COUNT, Math.floor(parsed)));
+  const maxCount = provider === "bocha" ? MAX_BOCHA_SEARCH_COUNT : MAX_SEARCH_COUNT;
+  const clamped = Math.max(1, Math.min(maxCount, Math.floor(parsed)));
   return clamped;
 }
 
@@ -318,6 +402,25 @@ async function runPerplexitySearch(params: {
 }): Promise<{ content: string; citations: string[] }> {
   const endpoint = `${params.baseUrl.replace(/\/$/, "")}/chat/completions`;
 
+  const requestBody = {
+    model: params.model,
+    messages: [
+      {
+        role: "user",
+        content: params.query,
+      },
+    ],
+  };
+
+  log.info("Perplexity search request", {
+    provider: "perplexity",
+    query: params.query,
+    model: params.model,
+    baseUrl: params.baseUrl,
+    endpoint,
+    requestBody,
+  });
+
   const res = await fetch(endpoint, {
     method: "POST",
     headers: {
@@ -326,15 +429,7 @@ async function runPerplexitySearch(params: {
       "HTTP-Referer": "https://openclaw.ai",
       "X-Title": "OpenClaw Web Search",
     },
-    body: JSON.stringify({
-      model: params.model,
-      messages: [
-        {
-          role: "user",
-          content: params.query,
-        },
-      ],
-    }),
+    body: JSON.stringify(requestBody),
     signal: withTimeout(undefined, params.timeoutSeconds * 1000),
   });
 
@@ -347,7 +442,124 @@ async function runPerplexitySearch(params: {
   const content = data.choices?.[0]?.message?.content ?? "No response";
   const citations = data.citations ?? [];
 
+  log.info("Perplexity search response", {
+    provider: "perplexity",
+    query: params.query,
+    status: res.status,
+    contentLength: content.length,
+    citationsCount: citations.length,
+    citations,
+    response: data,
+  });
+
   return { content, citations };
+}
+
+async function runBochaSearch(params: {
+  query: string;
+  count: number;
+  apiKey: string;
+  timeoutSeconds: number;
+  freshness?: string;
+  site?: string;
+  summary?: boolean;
+}): Promise<{
+  results: Array<{
+    title?: string;
+    url?: string;
+    description?: string;
+    siteName?: string;
+    siteIcon?: string;
+    published?: string;
+    imageUrl?: string;
+  }>;
+  summary?: string;
+}> {
+  const body: Record<string, unknown> = {
+    query: params.query,
+    count: params.count,
+  };
+
+  if (params.summary !== undefined) {
+    body.summary = params.summary;
+  }
+
+  if (params.freshness) {
+    body.freshness = params.freshness;
+  } else {
+    body.freshness = "noLimit";
+  }
+
+  if (params.site) {
+    body.site = params.site;
+  }
+
+  log.info("Bocha search request", {
+    provider: "bocha",
+    query: params.query,
+    count: params.count,
+    freshness: body.freshness,
+    site: params.site,
+    summary: params.summary,
+    endpoint: BOCHA_SEARCH_ENDPOINT,
+    requestBody: body,
+  });
+
+  const res = await fetch(BOCHA_SEARCH_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${params.apiKey}`,
+    },
+    body: JSON.stringify(body),
+    signal: withTimeout(undefined, params.timeoutSeconds * 1000),
+  });
+
+  if (!res.ok) {
+    const detail = await readResponseText(res);
+    throw new Error(`Bocha Search API error (${res.status}): ${detail || res.statusText}`);
+  }
+
+  const response = (await res.json()) as BochaSearchResponse;
+
+  // Extract web pages from the nested structure
+  const webPages = response.data?.webPages?.value ?? [];
+  const images = response.data?.images?.value ?? [];
+
+  // Create a map of images by host page URL for quick lookup
+  const imageMap = new Map<string, string>();
+  for (const img of images) {
+    if (img.hostPageUrl && img.thumbnailUrl) {
+      imageMap.set(img.hostPageUrl, img.thumbnailUrl);
+    }
+  }
+
+  // Map web pages to our result format
+  const results = webPages.map((page) => {
+    const imageUrl = page.url ? imageMap.get(page.url) : undefined;
+    return {
+      title: page.name,
+      url: page.url,
+      description: page.snippet,
+      siteName: page.siteName,
+      siteIcon: page.siteIcon,
+      published: page.datePublished,
+      imageUrl,
+    };
+  });
+
+  const summary = response.summary;
+
+  log.info("Bocha search response", {
+    provider: "bocha",
+    query: params.query,
+    status: res.status,
+    resultsCount: results.length,
+    hasSummary: !!summary,
+    response,
+  });
+
+  return { results, summary };
 }
 
 async function runWebSearch(params: {
@@ -363,11 +575,15 @@ async function runWebSearch(params: {
   freshness?: string;
   perplexityBaseUrl?: string;
   perplexityModel?: string;
+  site?: string;
+  summary?: boolean;
 }): Promise<Record<string, unknown>> {
   const cacheKey = normalizeCacheKey(
     params.provider === "brave"
       ? `${params.provider}:${params.query}:${params.count}:${params.country || "default"}:${params.search_lang || "default"}:${params.ui_lang || "default"}:${params.freshness || "default"}`
-      : `${params.provider}:${params.query}:${params.count}:${params.country || "default"}:${params.search_lang || "default"}:${params.ui_lang || "default"}`,
+      : params.provider === "bocha"
+        ? `${params.provider}:${params.query}:${params.count}:${params.freshness || "default"}:${params.site || "default"}:${params.summary || false}`
+        : `${params.provider}:${params.query}:${params.count}:${params.country || "default"}:${params.search_lang || "default"}:${params.ui_lang || "default"}`,
   );
   const cached = readCache(SEARCH_CACHE, cacheKey);
   if (cached) {
@@ -397,6 +613,48 @@ async function runWebSearch(params: {
     return payload;
   }
 
+  if (params.provider === "bocha") {
+    const { results, summary } = await runBochaSearch({
+      query: params.query,
+      count: params.count,
+      apiKey: params.apiKey,
+      timeoutSeconds: params.timeoutSeconds,
+      freshness: params.freshness,
+      site: params.site,
+      summary: params.summary,
+    });
+
+    const mapped = results.map((entry) => {
+      const description = entry.description ?? "";
+      const title = entry.title ?? "";
+      const url = entry.url ?? "";
+      return {
+        title: title ? wrapWebContent(title, "web_search") : "",
+        url, // Keep raw for tool chaining
+        description: description ? wrapWebContent(description, "web_search") : "",
+        published: entry.published || undefined,
+        siteName: entry.siteName || undefined,
+        siteIcon: entry.siteIcon || undefined,
+        imageUrl: entry.imageUrl || undefined,
+      };
+    });
+
+    const payload: Record<string, unknown> = {
+      query: params.query,
+      provider: params.provider,
+      count: mapped.length,
+      tookMs: Date.now() - start,
+      results: mapped,
+    };
+
+    if (summary) {
+      payload.summary = wrapWebContent(summary);
+    }
+
+    writeCache(SEARCH_CACHE, cacheKey, payload, params.cacheTtlMs);
+    return payload;
+  }
+
   if (params.provider !== "brave") {
     throw new Error("Unsupported web search provider.");
   }
@@ -416,6 +674,17 @@ async function runWebSearch(params: {
   if (params.freshness) {
     url.searchParams.set("freshness", params.freshness);
   }
+
+  log.info("Brave search request", {
+    provider: "brave",
+    query: params.query,
+    count: params.count,
+    country: params.country,
+    search_lang: params.search_lang,
+    ui_lang: params.ui_lang,
+    freshness: params.freshness,
+    url: url.toString(),
+  });
 
   const res = await fetch(url.toString(), {
     method: "GET",
@@ -447,6 +716,14 @@ async function runWebSearch(params: {
     };
   });
 
+  log.info("Brave search response", {
+    provider: "brave",
+    query: params.query,
+    status: res.status,
+    resultsCount: mapped.length,
+    response: data,
+  });
+
   const payload = {
     query: params.query,
     provider: params.provider,
@@ -473,7 +750,9 @@ export function createWebSearchTool(options?: {
   const description =
     provider === "perplexity"
       ? "Search the web using Perplexity Sonar (direct or via OpenRouter). Returns AI-synthesized answers with citations from real-time web search."
-      : "Search the web using Brave Search API. Supports region-specific and localized search via country and language parameters. Returns titles, URLs, and snippets for fast research.";
+      : provider === "bocha"
+        ? "Search the web using Bocha Search API. Supports natural language queries, time range filtering, site-specific search, and text summaries. Returns up to 50 results with titles, URLs, descriptions, site names, icons, publish dates, and image links."
+        : "Search the web using Brave Search API. Supports region-specific and localized search via country and language parameters. Returns titles, URLs, and snippets for fast research.";
 
   return {
     label: "Web Search",
@@ -484,7 +763,7 @@ export function createWebSearchTool(options?: {
       const perplexityAuth =
         provider === "perplexity" ? resolvePerplexityApiKey(perplexityConfig) : undefined;
       const apiKey =
-        provider === "perplexity" ? perplexityAuth?.apiKey : resolveSearchApiKey(search);
+        provider === "perplexity" ? perplexityAuth?.apiKey : resolveSearchApiKey(search, provider);
 
       if (!apiKey) {
         return jsonResult(missingSearchKeyPayload(provider));
@@ -497,25 +776,87 @@ export function createWebSearchTool(options?: {
       const search_lang = readStringParam(params, "search_lang");
       const ui_lang = readStringParam(params, "ui_lang");
       const rawFreshness = readStringParam(params, "freshness");
-      if (rawFreshness && provider !== "brave") {
+      const site = readStringParam(params, "site");
+      const summary = params.summary !== undefined ? Boolean(params.summary) : undefined;
+
+      if (country && provider !== "brave") {
         return jsonResult({
-          error: "unsupported_freshness",
-          message: "freshness is only supported by the Brave web_search provider.",
+          error: "unsupported_country",
+          message: "country is only supported by the Brave web_search provider.",
           docs: "https://docs.openclaw.ai/tools/web",
         });
       }
-      const freshness = rawFreshness ? normalizeFreshness(rawFreshness) : undefined;
-      if (rawFreshness && !freshness) {
+      if (search_lang && provider !== "brave") {
         return jsonResult({
-          error: "invalid_freshness",
-          message:
-            "freshness must be one of pd, pw, pm, py, or a range like YYYY-MM-DDtoYYYY-MM-DD.",
+          error: "unsupported_search_lang",
+          message: "search_lang is only supported by the Brave web_search provider.",
           docs: "https://docs.openclaw.ai/tools/web",
         });
+      }
+      if (ui_lang && provider !== "brave") {
+        return jsonResult({
+          error: "unsupported_ui_lang",
+          message: "ui_lang is only supported by the Brave web_search provider.",
+          docs: "https://docs.openclaw.ai/tools/web",
+        });
+      }
+      if (site && provider !== "bocha") {
+        return jsonResult({
+          error: "unsupported_site",
+          message: "site is only supported by the Bocha web_search provider.",
+          docs: "https://docs.openclaw.ai/tools/web",
+        });
+      }
+      if (summary !== undefined && provider !== "bocha") {
+        return jsonResult({
+          error: "unsupported_summary",
+          message: "summary is only supported by the Bocha web_search provider.",
+          docs: "https://docs.openclaw.ai/tools/web",
+        });
+      }
+      let freshness: string | undefined;
+      if (rawFreshness) {
+        if (provider === "bocha") {
+          // Bocha supports: "noLimit", "pd", "pw", "pm", "py", or date range
+          const trimmed = rawFreshness.trim();
+          if (
+            trimmed === "noLimit" ||
+            trimmed === "pd" ||
+            trimmed === "pw" ||
+            trimmed === "pm" ||
+            trimmed === "py"
+          ) {
+            freshness = trimmed;
+          } else {
+            // Try to validate as date range
+            const normalized = normalizeFreshness(rawFreshness);
+            if (normalized) {
+              freshness = normalized;
+            } else {
+              return jsonResult({
+                error: "invalid_freshness",
+                message:
+                  "freshness must be one of 'noLimit', 'pd', 'pw', 'pm', 'py', or a date range like YYYY-MM-DDtoYYYY-MM-DD.",
+                docs: "https://docs.openclaw.ai/tools/web",
+              });
+            }
+          }
+        } else {
+          // Brave uses normalizeFreshness
+          freshness = normalizeFreshness(rawFreshness);
+          if (!freshness) {
+            return jsonResult({
+              error: "invalid_freshness",
+              message:
+                "freshness must be one of pd, pw, pm, py, or a range like YYYY-MM-DDtoYYYY-MM-DD.",
+              docs: "https://docs.openclaw.ai/tools/web",
+            });
+          }
+        }
       }
       const result = await runWebSearch({
         query,
-        count: resolveSearchCount(count, DEFAULT_SEARCH_COUNT),
+        count: resolveSearchCount(count, DEFAULT_SEARCH_COUNT, provider),
         apiKey,
         timeoutSeconds: resolveTimeoutSeconds(search?.timeoutSeconds, DEFAULT_TIMEOUT_SECONDS),
         cacheTtlMs: resolveCacheTtlMs(search?.cacheTtlMinutes, DEFAULT_CACHE_TTL_MINUTES),
@@ -530,6 +871,8 @@ export function createWebSearchTool(options?: {
           perplexityAuth?.apiKey,
         ),
         perplexityModel: resolvePerplexityModel(perplexityConfig),
+        site,
+        summary,
       });
       return jsonResult(result);
     },

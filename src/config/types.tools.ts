@@ -336,11 +336,11 @@ export type ToolsConfig = {
     search?: {
       /** Enable web search tool (default: true when API key is present). */
       enabled?: boolean;
-      /** Search provider ("brave" or "perplexity"). */
-      provider?: "brave" | "perplexity";
-      /** Brave Search API key (optional; defaults to BRAVE_API_KEY env var). */
+      /** Search provider ("brave", "perplexity", or "bocha"). */
+      provider?: "brave" | "perplexity" | "bocha";
+      /** Brave Search API key (optional; defaults to BRAVE_API_KEY env var). For Bocha, use BOCHA_API_KEY env var. */
       apiKey?: string;
-      /** Default search results count (1-10). */
+      /** Default search results count (1-10 for brave/perplexity, 1-50 for bocha). */
       maxResults?: number;
       /** Timeout in seconds for search requests. */
       timeoutSeconds?: number;
